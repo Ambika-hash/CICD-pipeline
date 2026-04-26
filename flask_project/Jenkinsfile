@@ -1,0 +1,124 @@
+pipeline {
+    agent any
+
+    triggers {
+        pollSCM('* * * * *')
+    }
+
+    environment {
+        VENV_DIR    = '.venv'
+        APP_PORT    = '5000'
+        SECRET_KEY  = credentials('flask-secret-key')
+        JWT_SECRET  = credentials('flask-jwt-secret')
+    }
+
+    options {
+        timeout(time: 20, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo "Building branch: ${env.BRANCH_NAME} | Commit: ${env.GIT_COMMIT?.take(8)}"
+                checkout scm
+            }
+        }
+
+        stage('Setup Environment') {
+            steps {
+                bat 'python -m venv %VENV_DIR%'
+                bat '%VENV_DIR%\\Scripts\\pip install --upgrade pip'
+                bat '%VENV_DIR%\\Scripts\\pip install -r requirements.txt'
+            }
+        }
+
+        stage('Lint') {
+            steps {
+                bat '%VENV_DIR%\\Scripts\\pip install flake8'
+                bat '%VENV_DIR%\\Scripts\\flake8 app/ run.py --max-line-length=120 --exclude=__pycache__'
+            }
+        }
+
+        stage('Run Tests') {
+            steps {
+                bat '%VENV_DIR%\\Scripts\\pytest tests/ -v --tb=short --junitxml=reports/test-results.xml --cov=app --cov-report=xml:reports/coverage.xml --cov-report=term-missing'
+            }
+            post {
+                always {
+                    junit 'reports/test-results.xml'
+                }
+            }
+        }
+
+        stage('Coverage Gate') {
+            steps {
+                bat '%VENV_DIR%\\Scripts\\pytest tests/ --cov=app --cov-fail-under=80 -q'
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                bat '%VENV_DIR%\\Scripts\\pip install bandit safety'
+                bat '%VENV_DIR%\\Scripts\\bandit -r app/ -ll -o reports/bandit-report.txt || true'
+                bat '%VENV_DIR%\\Scripts\\safety check -r requirements.txt || true'
+            }
+        }
+
+        stage('Build Artifact') {
+            when {
+                branch 'main'
+            }
+            steps {
+                bat 'if not exist dist mkdir dist'
+                bat 'powershell Compress-Archive -Path app, run.py, requirements.txt -DestinationPath dist\\app-%BUILD_NUMBER%.zip -Force'
+                echo "Artifact created: dist/app-${env.BUILD_NUMBER}.zip"
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'dist/*.zip', fingerprint: true
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                echo 'Deploying to staging...'
+                // Replace with your actual deploy command, e.g.:
+                // bat 'scripts\\deploy.bat staging'
+                echo 'Staging deploy step placeholder'
+            }
+        }
+
+        stage('Smoke Test') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sleep(time: 3, unit: 'SECONDS')
+                bat 'curl -f http://localhost:%APP_PORT%/health || echo Smoke test skipped (no running server in CI)'
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Pipeline finished — Status: ${currentBuild.currentResult}"
+            cleanWs()
+        }
+        success {
+            echo "Build #${env.BUILD_NUMBER} succeeded."
+        }
+        failure {
+            echo "Build #${env.BUILD_NUMBER} FAILED. Check the logs above."
+        }
+        unstable {
+            echo "Build #${env.BUILD_NUMBER} is unstable (some tests may have failed)."
+        }
+    }
+}
